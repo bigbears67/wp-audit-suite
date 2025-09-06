@@ -4,12 +4,12 @@ WP Audit Suite est une collection de modules PHP en **lecture seule** pour audit
 L’objectif : fournir un diagnostic clair et rapide sur la sécurité, les fichiers, la configuration et la base de données **sans aucune action destructive**.
 
 ---
-<div class="card">
-  <div class="note">
+
     🔔 Rappel : WP Audit Suite est un outil d’audit <b>lecture seule</b>. Ne le laissez pas en production :
     <b>supprimez</b> les fichiers une fois l’audit terminé.
-  </div>
-</div>
+
+
+
 ## 🧩 Modules inclus
 
 - **audit_index.php** — Tableau de bord central pour accéder aux audits.
