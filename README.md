@@ -5,10 +5,8 @@ L’objectif : fournir un diagnostic clair et rapide sur la sécurité, les fich
 
 ---
 
-    🔔 Rappel : WP Audit Suite est un outil d’audit <b>lecture seule</b>. Ne le laissez pas en production :
-    <b>supprimez</b> les fichiers une fois l’audit terminé.
-
-
+ 🔔 Rappel : WP Audit Suite est un outil d’audit lecture seule. Ne le laissez pas en production :
+    supprimez les fichiers une fois l’audit terminé.
 
 ## 🧩 Modules inclus
 
