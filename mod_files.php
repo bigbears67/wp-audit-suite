@@ -306,7 +306,11 @@ input[type="search"], select{background:#0b1220;border:1px solid var(--b);border
 </head><body>
 
 <h1>mod_files <small>— scan fichiers PHP (contexte)</small></h1>
-
+<div style="margin-bottom: 16px;">
+  <button onclick="history.back()" style="background: #0b1220; border: 1px solid #1f2937; border-radius: 10px; padding: 10px 14px; color: #e2e8f0; font-family: inherit; font-size: 14px; cursor: pointer;">
+    &larr; Précédent
+  </button>
+</div>
 <div class="card">
   <div class="grid">
     <div class="kpi"><div class="v"><?=esc((string)$scanned)?></div><div>Fichiers scannés</div></div>
@@ -362,7 +366,12 @@ input[type="search"], select{background:#0b1220;border:1px solid var(--b);border
   <a href="?<?=htmlspecialchars(http_build_query(array_merge($_GET, ['format'=>'txt'])), ENT_QUOTES)?>">Exporter texte</a>
   <span class="note"> — Ajoute <code>&max=500</code> si besoin de limiter.</span>
 </div>
-
+<div class="card">
+  <div class="note">
+    🔔 Rappel : WP Audit Suite est un outil d’audit <b>lecture seule</b>. Ne le laissez pas en production :
+    <b>supprimez</b> les fichiers une fois l’audit terminé.
+  </div>
+</div>
 <script>
 // Filtres client
 const q   = document.getElementById('q');
