@@ -230,6 +230,12 @@ foreach ($rows as $r){
 }
 ?>
 <h1>mod_headers <small>— en-têtes thèmes/plugins</small></h1>
+
+<div style="margin-bottom: 16px;">
+  <button onclick="history.back()" style="background: #0b1220; border: 1px solid #1f2937; border-radius: 10px; padding: 10px 14px; color: #e2e8f0; font-family: inherit; font-size: 14px; cursor: pointer;">
+    &larr; Précédent
+  </button>
+</div>
 <div class="card">
   <div class="grid">
     <div class="kpi"><div class="v"><?=esc((string)$tot)?></div><div>Total</div></div>
@@ -281,7 +287,12 @@ foreach ($rows as $r){
 <div class="card">
   <small class="note">Astuce : ajoute <code>?format=json</code> pour l’export ; <code>?max=500</code> pour plafonner. Module lecture seule.</small>
 </div>
-
+<div class="card">
+  <div class="note">
+    🔔 Rappel : WP Audit Suite est un outil d’audit <b>lecture seule</b>. Ne le laissez pas en production :
+    <b>supprimez</b> les fichiers une fois l’audit terminé.
+  </div>
+</div>
 <script>
 const q   = document.getElementById('q');
 const lvl = document.getElementById('lvl');
