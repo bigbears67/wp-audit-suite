@@ -1,499 +1,752 @@
-<?php
+<?php declare(strict_types=1);
+require __DIR__ . '/audit_config.php';
+
 /**
- * WP Audit Suite — mod_data.php (corrected)
- * Analyse (lecture seule) des données structurées: JSON-LD, Microdata, RDFa
+ * mod_db — audit lecture seule de la base WordPress (prefix courant)
  *
- * Paramètres :
- *   ?key=VOTRE_AUDIT_KEY
- *   &max=50
- *   &include_sitemap=1
- *   &test_logo_size=0
+ * Détecte :
+ *  - Tables "core" en double / préfixes suspects (ex: wp0ptions, wpposts, prefix_system, etc.)
+ *  - Tables hors préfixe attendu mais ressemblant à du core (levenshtein court)
+ *  - Options autoload trop lourdes (seuils) + TOP N
+ *  - Charges suspectes dans wp_options (base64 long, gzinflate, <php, remote URLs…)
+ *  - Cron volumineux (option 'cron')
+ *  - Comptes administrateurs (liste informative)
+ *  - Taille des tables + TOP N
+ *
+ * Params:
+ *  - key=...                    (obligatoire)
+ *  - format=html|txt|json       (défaut: html)
+ *  - max=1500                   (plafond lignes renvoyées)
+ *  - prefix=xxx_                (défaut: $wpdb->prefix si WP chargé)
+ *  - deep=0|1                   (si 1, scanne plus d’items dans options)
+ *  - top=50                     (TOP N pour tableaux récapitulatifs)
  */
 
-// 1) Charger la config commune
-$cfgFile = __DIR__ . '/audit_config.php';
-if (is_readable($cfgFile)) {
-    require_once $cfgFile;
+$format  = strtolower((string)($_GET['format'] ?? 'html'));
+$max     = (int)($_GET['max'] ?? DEFAULT_MAX);
+$deep    = (int)($_GET['deep'] ?? 0) === 1;
+$topN    = max(5, (int)($_GET['top'] ?? 50));
+$scanLinks = (int)($_GET['links'] ?? 0) === 1;
+
+
+$recommend = (int)($_GET['recommend'] ?? 0) === 1;
+
+$tableWarnMB            = (int)($_GET['table_warn_mb'] ?? 8);       // grosses tables
+$autoloadWarnTotalMB    = (int)($_GET['autoload_warn_total_mb'] ?? 2);
+$autoloadWarnOneKB      = (int)($_GET['autoload_warn_one_kb'] ?? 1024);
+$cronWarnMB             = (int)($_GET['cron_warn_mb'] ?? 5);
+
+// conversions
+$tableWarnBytes         = max(1, $tableWarnMB) * 1024 * 1024;
+$autoloadWarnTotalBytes = max(1, $autoloadWarnTotalMB) * 1024 * 1024;
+$autoloadWarnOneBytes   = max(1, $autoloadWarnOneKB) * 1024;
+$cronWarnBytes          = max(1, $cronWarnMB) * 1024 * 1024;
+
+/* -------- Connexion & préfixe -------- */
+if ($WP_LOADED && isset($GLOBALS['wpdb']) && $GLOBALS['wpdb'] instanceof wpdb) {
+  /** @var wpdb $wpdb */
+  $wpdb = $GLOBALS['wpdb'];
+  $db_name = $wpdb->dbname;
+  $dbh     = $wpdb->dbh; // mysqli|resource
+  $prefix  = (string)($_GET['prefix'] ?? $wpdb->prefix);
+  $prefix  = $prefix !== '' ? $prefix : $wpdb->prefix;
+  // petite normalisation
+  if ($prefix !== '' && substr($prefix, -1) !== '_') { $prefix .= '_'; }
+  $use_wpdb = true;
+} else {
+  // fallback mysqli via wp-config
+  if (!defined('DB_NAME') || !defined('DB_USER') || !defined('DB_PASSWORD') || !defined('DB_HOST')) {
+    respond("WordPress non chargé et constantes DB_* absentes : impossible de scanner.\n", 'txt', 500);
+    exit;
+  }
+  $mysqli = @mysqli_connect(DB_HOST, DB_USER, DB_PASSWORD, DB_NAME);
+  if (!$mysqli) {
+    respond("Connexion MySQL échouée: " . @mysqli_connect_error() . "\n", 'txt', 500);
+    exit;
+  }
+  $db_name = DB_NAME;
+  $dbh     = $mysqli;
+  $prefix  = (string)($_GET['prefix'] ?? 'wp_');
+  if ($prefix !== '' && substr($prefix, -1) !== '_') { $prefix .= '_'; }
+  $use_wpdb = false;
 }
 
-// 1.b) Secours: helpers minimaux si absents
-if (!function_exists('h')) { function h($s){ return htmlspecialchars((string)$s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); } }
-if (!function_exists('truncate')) {
-    function truncate($s, $max=700){
-        $s = (string)$s; if (strlen($s) <= $max) return $s; return substr($s, 0, $max-3) . '...';
-    }
+/* -------- Helpers requêtes -------- */
+function db_query_all($dbh, string $sql): array {
+  if ($dbh instanceof mysqli) {
+    $res = $dbh->query($sql);
+    if (!$res) return [];
+    $rows = [];
+    while ($row = $res->fetch_assoc()) $rows[] = $row;
+    $res->free();
+    return $rows;
+  }
+  // wpdb
+  /** @var wpdb $GLOBALS['wpdb'] */
+  $wpdb = $GLOBALS['wpdb'];
+  $out = $wpdb->get_results($sql, ARRAY_A);
+  return is_array($out) ? $out : [];
 }
-if (!function_exists('badge')) {
-    function badge($label, $type='default'){
-        $colors = [
-            'OK' => '#16a34a', 'INFO' => '#2563eb', 'ALERTE' => '#d97706', 'CRITIQUE' => '#dc2626', 'default' => '#334155'
-        ];
-        $c = $colors[$type] ?? $colors['default'];
-        return '<span style="display:inline-block;padding:2px 8px;border-radius:9999px;background:'.$c.';color:#fff;font:12px/1.4 system-ui,Segoe UI,Roboto,Helvetica,Arial">'.h($label).'</span>';
-    }
+
+function esc_like(string $s): string {
+  return strtr($s, ['%' => '\%', '_' => '\_', '\\' => '\\\\']);
 }
-if (!function_exists('print_header')) {
-    function print_header($title='WP Audit Suite — Données structurées'){
-        $titleEsc = h($title);
-        $html = <<<'HTML'
+
+function bytesHumanDB(int $n): string {
+  $u = ['B','KB','MB','GB','TB']; $i=0; $f=(float)$n;
+  while($f>=1024 && $i<count($u)-1){ $f/=1024; $i++; }
+  return rtrim(rtrim(number_format($f,2,'.',''), '0'),'.').' '.$u[$i];
+}
+
+/* -------- Collecte -------- */
+$rows = []; // lignes de findings
+$push = function(array $r) use (&$rows, $max) {
+  if (count($rows) < $max) $rows[] = $r;
+};
+
+$now = date('Y-m-d H:i:s');
+$head = [
+  "# mod_db — audit DB",
+  "DB: {$db_name} | Prefix: {$prefix} | {$now}"
+];
+
+/* =========================
+ *  0) Domaines externes (posts/pages) — optionnel via &links=1
+ * ========================= */
+$externalDomains = [];
+$siteHost = null;
+if ($scanLinks) {
+  // Déduire domaine du site
+  if ($WP_LOADED && function_exists('home_url')) {
+    $siteUrl = home_url('/');
+  } else {
+    $opt = db_query_all($dbh, "SELECT option_value FROM `{$prefix}options` WHERE option_name IN ('home','siteurl') ORDER BY CASE option_name WHEN 'home' THEN 0 ELSE 1 END LIMIT 1");
+    $siteUrl = $opt[0]['option_value'] ?? '';
+  }
+  $siteHost = parse_url((string)$siteUrl, PHP_URL_HOST);
+  $siteHost = $siteHost ? strtolower(preg_replace('/^www\./','',$siteHost)) : null;
+
+  $sql = "SELECT ID, post_title, post_type, post_status, post_content
+          FROM `{$prefix}posts`
+          WHERE post_status IN ('publish','inherit') AND post_content REGEXP 'https?://'
+          LIMIT {$max}";
+  $posts = db_query_all($dbh, $sql);
+  foreach ($posts as $p) {
+    $content = (string)$p['post_content'];
+    if ($content === '') continue;
+    if (preg_match_all('~https?://[^\s"\'<>\)\(]+~i', $content, $m)) {
+      foreach ($m[0] as $url) {
+        $parts = @parse_url($url);
+        if (!$parts || empty($parts['host'])) continue;
+        $host = strtolower(preg_replace('/^www\./','',$parts['host']));
+        if ($siteHost && $host === $siteHost) continue;
+        if (filter_var($host, FILTER_VALIDATE_IP)) {
+          if (preg_match('/^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[0-1])\.)/', $host)) continue;
+        }
+        if (!isset($externalDomains[$host])) $externalDomains[$host] = ['count'=>0,'examples'=>[]];
+        $externalDomains[$host]['count']++;
+        if (count($externalDomains[$host]['examples']) < 3) {
+          $externalDomains[$host]['examples'][] = [
+            'id'    => (int)$p['ID'],
+            'title' => (string)$p['post_title'],
+            'url'   => (string)$url,
+          ];
+        }
+      }
+    }
+  }
+  uasort($externalDomains, function($a,$b){ return $b['count'] <=> $a['count']; });
+}
+
+/* =========================
+ *  1) Inventaire tables & préfixes
+ * ========================= */
+$schema = addslashes($db_name);
+$sqlTables = "
+  SELECT table_name, engine, table_rows, data_length, index_length, create_time, table_collation
+  FROM information_schema.tables
+  WHERE table_schema = '{$schema}'
+  ORDER BY table_name
+";
+$tables = db_query_all($dbh, $sqlTables);
+
+$coreNames = [
+  'options','users','usermeta','posts','postmeta','terms','termmeta',
+  'term_taxonomy','term_relationships','comments','commentmeta','links'
+];
+
+// repérage préfixes présents
+$prefixCounts = [];
+foreach ($tables as $t) {
+  $name = $t['table_name'];
+  if (preg_match('/^([a-zA-Z0-9_]+_)/', $name, $m)) {
+    $p = $m[1];
+  } else {
+    $p = '';
+  }
+  $prefixCounts[$p] = ($prefixCounts[$p] ?? 0) + 1;
+}
+
+// tables avec notre préfixe
+$mine = [];
+$others = [];
+foreach ($tables as $t) {
+  $name = $t['table_name'];
+  if (strpos($name, $prefix) === 0) $mine[] = $t; else $others[] = $t;
+}
+
+// tables “core” attendues
+$expectedCore = array_map(fn($n) => $prefix.$n, $coreNames);
+
+// 1.a) Tables core manquantes (INFO)
+foreach ($expectedCore as $core) {
+  $found = false;
+  foreach ($mine as $t) if ($t['table_name'] === $core) { $found = true; break; }
+  if (!$found) {
+    $push(['severity'=>'INFO','type'=>'core_missing','object'=>$core,'detail'=>'Table core non trouvée (peut être normal selon contexte)']);
+  }
+}
+
+// 1.b) Tables look-alike (ALERTE): ressemblent à du core mais orthographe modifiée (levenshtein 1-2)
+foreach ($others as $t) {
+  $name = $t['table_name'];
+  // repérer les noms qui finissent par un nom "core" altéré
+  foreach ($coreNames as $cn) {
+    // normalisé (remplacer 0->o, 1->l/i)
+    $norm = function(string $x){ return strtr(strtolower($x), ['0'=>'o','1'=>'l','5'=>'s']); };
+    $tail = substr($name, -strlen($cn));
+    if ($tail === '') continue;
+    $d = levenshtein($norm($tail), $norm($cn));
+    if ($d <= 2 && $tail !== $cn) {
+      $size = (int)$t['data_length'] + (int)$t['index_length'];
+      $push([
+        'severity'=>'ALERTE',
+        'type'=>'lookalike_core_table',
+        'object'=>$name,
+        'detail'=>"Rappelle '{$cn}' (distance={$d})",
+        'size'=>$size,
+        'extra'=>['engine'=>$t['engine'],'collation'=>$t['table_collation']]
+      ]);
+      break;
+    }
+  }
+}
+
+// 1.c) Tables “prefix_system* / backup / shadow” sous notre préfixe (ALERTE)
+foreach ($mine as $t) {
+  $name = $t['table_name'];
+  $short = substr($name, strlen($prefix));
+  if (preg_match('/^(system|shadow|backup|bak|tmp|old|copy|test)\b/i', $short)) {
+    $size = (int)$t['data_length'] + (int)$t['index_length'];
+    $push([
+      'severity'=>'ALERTE','type'=>'suspicious_prefix_table','object'=>$name,
+      'detail'=>"Nom anormal sous préfixe ({$short})",'size'=>$size
+    ]);
+  }
+}
+
+/* =========================
+ *  2) Options autoload & charges suspectes
+ * ========================= */
+$tblOptions = $prefix . 'options';
+
+// 2.a) Somme autoload + TOP N lourdes
+$sumAutoload = db_query_all($dbh, "SELECT SUM(LENGTH(option_value)) AS s FROM `{$tblOptions}` WHERE autoload='yes'");
+$totalAutoload = (int)($sumAutoload[0]['s'] ?? 0);
+
+$topLimit = $deep ? $topN : min($topN, 25);
+$topAuto = db_query_all($dbh, "
+  SELECT option_name, LENGTH(option_value) AS len
+  FROM `{$tblOptions}`
+  WHERE autoload='yes'
+  ORDER BY len DESC
+  LIMIT {$topLimit}
+");
+
+$thresholdTotal = 2*1024*1024; // 2 MB
+$thresholdOne   = 1*1024*1024; // 1 MB
+
+if ($totalAutoload > $thresholdTotal) {
+  $push(['severity'=>'ALERTE','type'=>'autoload_total','object'=>$tblOptions,'detail'=>'Total autoload élevé','size'=>$totalAutoload]);
+}
+foreach ($topAuto as $r) {
+  $sev = ((int)$r['len'] >= $thresholdOne) ? 'ALERTE' : 'INFO';
+  $push(['severity'=>$sev,'type'=>'autoload_heavy_option','object'=>$tblOptions,'detail'=>$r['option_name'],'size'=>(int)$r['len']]);
+}
+
+// 2.b) Charges suspectes (REGEXP simples, limitées)
+$limitScan = $deep ? 200 : 80; // nombre d’options max à remonter par motif
+$susp = [
+  ['base64_long', "REGEXP", "base64_decode\\s*\\(\\s*'[A-Za-z0-9+/=]{400,}'"],
+  ['gzinflate',   "LIKE",   "%gzinflate(%"],
+  ['php_tag',     "LIKE",   "%<?php%"],
+  ['preg_e',      "REGEXP", "preg_replace\\s*\\([^)]*/[imsxADSUXu]*e[imsxADSUXu]*['\"]\\s*\\)"],
+  ['remote_url',  "REGEXP", "https?://[^\\s'\"]+"],
+];
+foreach ($susp as [$label,$op,$pat]) {
+  if ($op === 'LIKE') {
+    $q = "SELECT option_name, LENGTH(option_value) AS len
+          FROM `{$tblOptions}`
+          WHERE option_value LIKE '".addslashes($pat)."'
+          ORDER BY len DESC LIMIT {$limitScan}";
+  } else {
+    $q = "SELECT option_name, LENGTH(option_value) AS len
+          FROM `{$tblOptions}`
+          WHERE option_value {$op} '{$pat}'
+          ORDER BY len DESC LIMIT {$limitScan}";
+  }
+  $hits = db_query_all($dbh, $q);
+  foreach ($hits as $h) {
+    $sev = ($label==='base64_long') ? 'ALERTE' : 'INFO';
+    $push(['severity'=>$sev,'type'=>"opt_{$label}",'object'=>$tblOptions,'detail'=>$h['option_name'],'size'=>(int)$h['len']]);
+  }
+}
+
+// 2.c) Cron volumineux
+$cron = db_query_all($dbh, "SELECT LENGTH(option_value) AS len FROM `{$tblOptions}` WHERE option_name='cron' LIMIT 1");
+if ($cron) {
+  $len = (int)$cron[0]['len'];
+  if ($len > 5*1024*1024) {
+    $push(['severity'=>'ALERTE','type'=>'cron_large','object'=>$tblOptions,'detail'=>'option_name=cron','size'=>$len]);
+  } elseif ($len > 1*1024*1024) {
+    $push(['severity'=>'INFO','type'=>'cron_large','object'=>$tblOptions,'detail'=>'option_name=cron','size'=>$len]);
+  }
+}
+
+/* =========================
+ *  3) Comptes administrateurs (inform.)
+ * ========================= */
+$tblUsers   = $prefix.'users';
+$tblUMeta   = $prefix.'usermeta';
+$capKeyLike = $prefix.'capabilities';
+
+$admins = db_query_all($dbh, "
+  SELECT u.ID, u.user_login, u.user_email, u.user_registered, m.meta_value AS caps
+  FROM `{$tblUsers}` u
+  JOIN `{$tblUMeta}` m ON (m.user_id=u.ID AND m.meta_key='".addslashes($capKeyLike)."')
+  WHERE m.meta_value LIKE '%administrator%'
+  ORDER BY u.user_registered DESC
+  LIMIT ".($deep?200:50)
+);
+foreach ($admins as $a) {
+  $detail = $a['user_login'].' <'.$a['user_email'].'>';
+  $push(['severity'=>'INFO','type'=>'admin_user','object'=>$tblUsers,'detail'=>$detail,'extra'=>['id'=>$a['ID'],'registered'=>$a['user_registered']]]);
+}
+
+/* =========================
+ *  4) Tables les plus lourdes (TOP N)
+ * ========================= */
+$topTables = $tables;
+usort($topTables, function($A,$B){
+  $sa = (int)$A['data_length'] + (int)$A['index_length'];
+  $sb = (int)$B['data_length'] + (int)$B['index_length'];
+  return $sb <=> $sa;
+});
+$topTables = array_slice($topTables, 0, $topN);
+foreach ($topTables as $t) {
+  $size = (int)$t['data_length'] + (int)$t['index_length'];
+  $push(['severity'=>'INFO','type'=>'table_size_top','object'=>$t['table_name'],'detail'=>$t['engine'].' / '.$t['table_collation'],'size'=>$size]);
+}
+/* =========================
+ *  5) Recommandations (lecture seule)
+ * ========================= */
+$advice = []; // chaque item: ['severity','title','why','suggestions'=>[...]] (texte uniquement)
+
+// A) Autoload
+if (isset($totalAutoload) && $totalAutoload > $autoloadWarnTotalBytes) {
+  $advice[] = [
+    'severity'    => 'ALERTE',
+    'title'       => 'Autoload total élevé',
+    'why'         => 'Le chargement automatique des options dépasse ' . bytesHumanDB($autoloadWarnTotalBytes) . ' (observé: ' . bytesHumanDB($totalAutoload) . ').',
+    'suggestions' => [
+      "Lister les options autoload lourdes (TOP 50) via le module ou WP-CLI :",
+      "wp option list --autoload=on --fields=option_name,size_bytes --format=json | jq 'sort_by(.size_bytes)|reverse|.[0:50]'",
+      "Vérifier si certaines options peuvent passer en autoload='no' (uniquement si non requises au bootstrap)."
+    ]
+  ];
+}
+// Autoload one heavy options
+if (!empty($topAuto)) {
+  foreach ($topAuto as $r) {
+    $len = (int)$r['len'];
+    if ($len >= $autoloadWarnOneBytes) {
+      $advice[] = [
+        'severity'    => 'ALERTE',
+        'title'       => "Option autoload lourde : {$r['option_name']}",
+        'why'         => 'Taille : ' . bytesHumanDB($len) . ' ≥ ' . bytesHumanDB($autoloadWarnOneBytes) . '.',
+        'suggestions' => [
+          "Vérifier l’utilité réelle de cette option au chargement de toutes les pages.",
+          "Diagnostic SQL (lecture seule) :",
+          "SELECT LENGTH(option_value) AS len FROM `{$tblOptions}` WHERE option_name='" . addslashes($r['option_name']) . "';"
+        ]
+      ];
+    }
+  }
+}
+
+// B) Cron volumineux
+if (!empty($cron)) {
+  $len = (int)$cron[0]['len'];
+  if ($len > $cronWarnBytes) {
+    $advice[] = [
+      'severity'    => 'ALERTE',
+      'title'       => "Option 'cron' volumineuse",
+      'why'         => 'Taille : ' . bytesHumanDB($len) . ' (> ' . bytesHumanDB($cronWarnBytes) . ').',
+      'suggestions' => [
+        "Contrôler les jobs récurrents bruyants (plugins d’automation/SEO/analytics).",
+        "WP-CLI (lecture): wp cron event list",
+        "Si Action Scheduler est utilisé massivement, voir les conseils associés ci-dessous."
+      ]
+    ];
+  }
+}
+
+// C) Tables bien connues : Action Scheduler, FluentSMTP logs, etc.
+$tblByName = [];
+foreach ($tables as $t) { $tblByName[$t['table_name']] = (int)$t['data_length'] + (int)$t['index_length']; }
+
+$asActions = $prefix.'actionscheduler_actions';
+$asLogs    = $prefix.'actionscheduler_logs';
+if (isset($tblByName[$asActions]) && $tblByName[$asActions] > $tableWarnBytes) {
+  $advice[] = [
+    'severity'    => 'ALERTE',
+    'title'       => 'Action Scheduler — table actions lourde',
+    'why'         => 'Taille de ' . bytesHumanDB($tblByName[$asActions]) . ' (> ' . bytesHumanDB($tableWarnBytes) . ').',
+    'suggestions' => [
+      "WP-CLI (lecture/gestion):",
+      "wp action-scheduler run",
+      "wp action-scheduler list --status=complete --format=table | head -n 50",
+      "Piste: réduire la rétention des actions terminées dans les plugins qui s’appuient dessus."
+    ]
+  ];
+}
+if (isset($tblByName[$asLogs]) && $tblByName[$asLogs] > $tableWarnBytes) {
+  $advice[] = [
+    'severity'    => 'ALERTE',
+    'title'       => 'Action Scheduler — table logs lourde',
+    'why'         => 'Taille de ' . bytesHumanDB($tblByName[$asLogs]) . ' (> ' . bytesHumanDB($tableWarnBytes) . ').',
+    'suggestions' => [
+      "WP-CLI (lecture): wp action-scheduler list --status=failed --format=table | head -n 50",
+      "Piste: réduire la rétention des logs (paramètres du/des plugins)."
+    ]
+  ];
+}
+
+// FluentSMTP logs
+$fsmpt = $prefix.'fsmpt_email_logs';
+if (isset($tblByName[$fsmpt]) && $tblByName[$fsmpt] > $tableWarnBytes) {
+  $advice[] = [
+    'severity'    => 'ALERTE',
+    'title'       => 'FluentSMTP — logs volumineux',
+    'why'         => 'Taille de ' . bytesHumanDB($tblByName[$fsmpt]) . ' (> ' . bytesHumanDB($tableWarnBytes) . ').',
+    'suggestions' => [
+      "Revoir la rétention des logs dans FluentSMTP (14–30 jours).",
+      "Lecture seule (exemples):",
+      "SELECT COUNT(*) FROM `{$fsmpt}`;"
+    ]
+  ];
+}
+
+// D) Posts/Postmeta
+$posts   = $prefix.'posts';
+$postmeta= $prefix.'postmeta';
+if (isset($tblByName[$posts]) && $tblByName[$posts] > $tableWarnBytes) {
+  $advice[] = [
+    'severity'    => 'INFO',
+    'title'       => 'Table posts importante',
+    'why'         => 'Taille de ' . bytesHumanDB($tblByName[$posts]) . ' (> ' . bytesHumanDB($tableWarnBytes) . ').',
+    'suggestions' => [
+      "Diagnostic (lecture): compter révisions, corbeilles.",
+      "WP-CLI: wp post list --post_type='revision' --format=count",
+      "WP-CLI: wp post list --post_status='trash' --format=count"
+    ]
+  ];
+}
+if (isset($tblByName[$postmeta]) && $tblByName[$postmeta] > $tableWarnBytes) {
+  $advice[] = [
+    'severity'    => 'INFO',
+    'title'       => 'Table postmeta importante',
+    'why'         => 'Taille de ' . bytesHumanDB($tblByName[$postmeta]) . ' (> ' . bytesHumanDB($tableWarnBytes) . ').',
+    'suggestions' => [
+      "Diagnostic (lecture) — métas orphelines :",
+      "SELECT COUNT(*) FROM `{$postmeta}` pm LEFT JOIN `{$posts}` p ON p.ID=pm.post_id WHERE p.ID IS NULL;"
+    ]
+  ];
+}
+
+
+
+
+/* =========================
+ *  Sorties JSON / TXT
+ * ========================= */
+if ($format === 'json') {
+  $payload = [
+    'module'  => 'mod_db',
+    'db'      => $db_name,
+    'prefix'  => $prefix,
+    'time'    => date('c'),
+    'count'   => count($rows),
+    'rows'    => $rows,
+    'prefixes'=> $prefixCounts,
+  ];
+  if ($scanLinks) {
+    $payload['external_domains'] = [
+      'site_host' => $siteHost,
+      'top' => array_slice($externalDomains, 0, $topN, true)
+    ];
+  }
+  if ($recommend) {
+    $payload['advice'] = $advice;
+    $payload['thresholds'] = [
+      'table_warn_mb' => $tableWarnMB,
+      'autoload_total_mb' => $autoloadWarnTotalMB,
+      'autoload_one_kb' => $autoloadWarnOneKB,
+      'cron_warn_mb' => $cronWarnMB,
+    ];
+  }
+  respond($payload, 'json'); exit;
+}
+
+
+if ($format === 'txt') {
+  $out = $head;
+  foreach ($rows as $r) {
+    $size = isset($r['size']) ? bytesHumanDB((int)$r['size']) : '—';
+    $extra= isset($r['extra']) ? json_encode($r['extra']) : '';
+    $out[] = sprintf("%s\t%s\t%s\t%s\t%s\t%s",
+      $r['severity'],
+      $r['type'],
+      $r['object'],
+      $size,
+      $r['detail'] ?? '',
+      $extra
+    );
+  }
+  respond(implode("\n", $out)."\n", 'txt'); exit;
+}
+
+/* =========================
+ *  HTML esthétique
+ * ========================= */
+header('Content-Type: text/html; charset=UTF-8');
+
+// KPI
+$tot = count($rows); $crit=$al=$info=0;
+foreach ($rows as $r){ if($r['severity']==='CRITIQUE')$crit++; elseif($r['severity']==='ALERTE')$al++; else $info++; }
+
+// Types pour filtre
+$types = []; foreach($rows as $r){ $types[$r['type']] = true; } ksort($types);
+
+// Prefix list
+arsort($prefixCounts);
+
+?>
 <!doctype html>
-<html lang="fr">
-<head>
+<html lang="fr"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<title>mod_db — Audit DB (prefix <?=esc($prefix)?>)</title>
 <style>
-:root{--fg:#0f172a;--muted:#475569;--bg:#0b1220;--card:#0f172a;--row:#0b1220;--ok:#16a34a;}
-body{margin:0;background:#0a0f1a;color:#e5e7eb;font:14px/1.6 system-ui,Segoe UI,Roboto,Helvetica,Arial}
-a{color:#93c5fd;text-decoration:none} a:hover{text-decoration:underline}
-header{padding:18px 22px;border-bottom:1px solid #1f2937;background:#0b1220;position:sticky;top:0;z-index:2}
-h1{margin:0;font-size:18px}
-.wrap{padding:20px}
-.card{background:#0f172a;border:1px solid #1f2937;border-radius:12px;padding:16px;margin:0 0 16px 0}
-table{width:100%;border-collapse:separate;border-spacing:0}
-th,td{padding:10px 12px;vertical-align:top}
-th{position:sticky;top:62px;background:#0f172a;border-bottom:1px solid #1f2937;text-align:left}
-tr:nth-child(odd){background:#0b1220}
-.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;white-space:pre-wrap;word-break:break-word}
-.grid{display:grid;gap:12px}
-.grid2{grid-template-columns:repeat(2,minmax(0,1fr))}
-.muted{color:#94a3b8}
-.small{font-size:12px}
-.kpi{display:flex;gap:12px;flex-wrap:wrap}
-.kpi>div{flex:1 1 160px;background:#0f172a;border:1px solid #1f2937;border-radius:12px;padding:12px}
+:root{--bg:#0f172a;--card:#111827;--muted:#94a3b8;--b:#1f2937;--ok:#22c55e;--warn:#f59e0b;--bad:#ef4444;--info:#60a5fa}
+*{box-sizing:border-box}
+body{background:var(--bg);color:#e2e8f0;font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;margin:0;padding:24px}
+h1{margin:0 0 12px} small{color:var(--muted)}
+.card{background:var(--card);border:1px solid var(--b);border-radius:12px;padding:16px;margin:14px 0}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.kpi{background:#0b1220;border:1px solid var(--b);border-radius:10px;padding:12px;text-align:center}
+.kpi .v{font-size:20px;font-weight:700}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid}
+.badge-ok{color:var(--ok);border-color:var(--ok)}
+.badge-warn{color:var(--warn);border-color:var(--warn)}
+.badge-bad{color:var(--bad);border-color:var(--bad)}
+.badge-info{color:var(--info);border-color:var(--info)}
+table{width:100%;border-collapse:collapse}
+th,td{padding:8px 10px;border-bottom:1px solid var(--b);vertical-align:top}
+th{background:#0b1220;text-align:left}
+td.size{white-space:nowrap}
+.controls{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+input[type="search"], select{background:#0b1220;border:1px solid var(--b);border-radius:8px;padding:8px;color:#e2e8f0}
+.note{color:var(--muted);font-size:12px}
+.nowrap{white-space:nowrap}
+.small{font-size:12px;color:var(--muted)}
+.prefixes{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+.prefixes .chip{background:#0b1220;border:1px solid var(--b);border-radius:999px;padding:4px 8px}
 </style>
-<title>
-HTML;
-        echo $html.$titleEsc;
-        echo <<<HTML
-</title>
 </head>
 <body>
-<header><h1>$titleEsc</h1></header>
+
+<h1>mod_db <small>— audit DB (prefix <?=esc($prefix)?>)</small></h1>
 <div style="margin-bottom: 16px;">
   <button onclick="history.back()" style="background: #0b1220; border: 1px solid #1f2937; border-radius: 10px; padding: 10px 14px; color: #e2e8f0; font-family: inherit; font-size: 14px; cursor: pointer;">
     &larr; Précédent
   </button>
 </div>
-<div class="wrap">
-HTML;
-    }
-}
-if (!function_exists('print_footer')) { function print_footer(){ echo "</div></body></html>"; } }
-if (!function_exists('enforce_auth_or_exit')) {
-    function enforce_auth_or_exit(){
-        if (!defined('AUDIT_KEY')) return; // si pas de clé définie dans la config, ne bloque pas (site de test)
-        $key = $_GET['key'] ?? '';
-        if (!hash_equals((string)AUDIT_KEY, (string)$key)){
-            http_response_code(403);
-            die('<meta charset="utf-8"><style>body{background:#0a0f1a;color:#e5e7eb;font:14px system-ui;padding:32px}</style><h1>403</h1><p>Clé d\'audit invalide.</p>');
-        }
-    }
-}
-if (!function_exists('detect_site_base_url')) {
-    function detect_site_base_url(){
-        if (defined('WP_HOME')) return rtrim(WP_HOME,'/');
-        if (defined('WP_SITEURL')) return rtrim(WP_SITEURL,'/');
-        $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
-        $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
-        return $scheme.'://'.$host;
-    }
-}
-if (!function_exists('http_get_local')) {
-    function http_get_local($url, $timeout=6){
-        $ch = curl_init($url);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_CONNECTTIMEOUT => $timeout,
-            CURLOPT_TIMEOUT => $timeout,
-            CURLOPT_USERAGENT => 'WP-Audit-Suite/mod_data (+https://webmaster67.fr)'
-        ]);
-        $body = curl_exec($ch);
-        $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-        curl_close($ch);
-        if ($code >= 200 && $code < 400) return $body;
-        return '';
-    }
-}
-if (!function_exists('fetch_urls_from_sitemaps')) {
-    function fetch_urls_from_sitemaps($base){
-        $out = [];
-        $candidates = [
-            $base.'/sitemap_index.xml',
-            $base.'/sitemap.xml',
-            $base.'/sitemap1.xml',
-        ];
-        $seen = [];
-        foreach ($candidates as $sm) {
-            $xml = http_get_local($sm, 5);
-            if (!$xml) continue;
-            if (!preg_match_all('#<loc>([^<]+)</loc>#i', $xml, $m)) continue;
-            foreach ($m[1] as $loc) {
-                $loc = trim($loc);
-                if (isset($seen[$loc])) continue; $seen[$loc]=1;
-                if (preg_match('#sitemap\-?\d*\.xml$#i', $loc) && $loc !== $sm) {
-                    $sub = http_get_local($loc,5);
-                    if ($sub && preg_match_all('#<loc>([^<]+)</loc>#i', $sub, $m2)){
-                        foreach ($m2[1] as $u) { $u=trim($u); if (!isset($seen[$u])) { $seen[$u]=1; $out[]=$u; } }
-                    }
-                } else {
-                    $out[] = $loc;
-                }
-            }
-        }
-        $out = array_values(array_filter($out, function($u){ return preg_match('#^https?://#i',$u); }));
-        return $out;
-    }
-}
-if (!function_exists('fetch_urls_from_wpdb')) {
-    function fetch_urls_from_wpdb($max=50){
-        $urls = [];
-        $root = dirname(__DIR__);
-        $wpConfig = $root.'/wp-config.php';
-        if (!is_readable($wpConfig)) {
-            $wpConfig = __DIR__.'/wp-config.php';
-        }
-        if (!is_readable($wpConfig)) return $urls;
-        include_once $wpConfig;
-        if (!defined('DB_NAME')) return $urls;
-        $mysqli = @new mysqli(DB_HOST, DB_USER, DB_PASSWORD, DB_NAME, defined('DB_PORT')?DB_PORT:3306);
-        if ($mysqli->connect_errno) return $urls;
-        $mysqli->set_charset('utf8mb4');
-        $prefix = defined('table_prefix') ? table_prefix : 'wp_';
-        $max = max(1, (int)$max);
-        $sql = "SELECT ID, post_type, post_name FROM {$prefix}posts WHERE post_status='publish' AND post_type IN ('page','post','product') ORDER BY post_date_gmt DESC LIMIT ".$max;
-        if ($res = $mysqli->query($sql)){
-            $home = '';
-            if ($r2 = $mysqli->query("SELECT option_value FROM {$prefix}options WHERE option_name='home'")){
-                $row=$r2->fetch_row(); $home = rtrim($row[0] ?? '', '/'); $r2->close();
-            }
-            while ($row = $res->fetch_assoc()){
-                $slug = $row['post_name'];
-                $type = $row['post_type'];
-                if ($type==='page')        $urls[] = $home.'/'.rawurlencode($slug);
-                elseif ($type==='post')    $urls[] = $home.'/'.rawurlencode($slug);
-                elseif ($type==='product') $urls[] = $home.'/product/'.rawurlencode($slug);
-            }
-            $res->close();
-        }
-        $mysqli->close();
-        return array_values(array_unique(array_filter($urls)));
-    }
-}
+<div class="card">
+  <div class="grid">
+    <div class="kpi"><div class="v"><?=esc((string)count($tables))?></div><div>Tables dans DB</div></div>
+    <div class="kpi"><div class="v"><?=esc((string)$tot)?></div><div>Détections</div></div>
+    <div class="kpi"><div class="v"><?=esc((string)$al)?></div><div class="badge badge-warn">Alertes</div></div>
+    <div class="kpi"><div class="v"><?=esc((string)$info)?></div><div class="badge badge-info">Infos</div></div>
+  
+</div>
 
-// 2) Auth
-enforce_auth_or_exit();
+<?php if ($scanLinks): ?>
+<div class="card">
+  <h3 style="margin:0 0 8px 0">Domaines externes référencés</h3>
+  <div class="small">Site : <code><?=esc((string)($siteHost ?? '—'))?></code> — internes exclus. Paramètres : <code>&links=1</code>, <code>&max=<?=esc((string)$max)?></code>, <code>&top=<?=esc((string)$topN)?></code>.</div>
+  <?php if (empty($externalDomains)): ?>
+    <div class="note">Aucun domaine externe détecté dans la limite actuelle.</div>
+  <?php else: ?>
+  <table style="width:100%;border-collapse:collapse;margin-top:8px">
+    <thead>
+      <tr>
+        <th style="text-align:left;border-bottom:1px solid var(--b);padding:6px 8px">Domaine</th>
+        <th style="text-align:right;border-bottom:1px solid var(--b);padding:6px 8px;width:110px">Occur.</th>
+        <th style="text-align:left;border-bottom:1px solid var(--b);padding:6px 8px">Exemples</th>
+      </tr>
+    </thead>
+    <tbody>
+      <?php $n=0; foreach ($externalDomains as $dom=>$data): if (++$n>$topN) break; ?>
+      <tr>
+        <td style="padding:6px 8px"><code><?=esc($dom)?></code></td>
+        <td style="padding:6px 8px;text-align:right"><span class="badge badge-info"><?=esc((string)$data['count'])?></span></td>
+        <td style="padding:6px 8px">
+          <?php foreach ($data['examples'] as $ex): ?>
+            <div class="small">[#<?=esc((string)$ex['id'])?>] <?=esc($ex['title'] ?: '(sans titre)')?> — <a href="<?=esc($ex['url'])?>" target="_blank" rel="noopener noreferrer"><?=esc($ex['url'])?></a></div>
+          <?php endforeach; ?>
+        </td>
+      </tr>
+      <?php endforeach; ?>
+    </tbody>
+  </table>
+  <?php endif; ?>
+</div>
+<?php endif; ?>
 
-// 3) Paramètres
-$max           = max(1, (int)($_GET['max'] ?? (defined('DEFAULT_MAX')?DEFAULT_MAX:50)));
-$useSitemap    = (int)($_GET['include_sitemap'] ?? 1) === 1;
-$testLogoSize  = (int)($_GET['test_logo_size'] ?? 0) === 1;
+	<?php if ($recommend): ?>
 
-$base = detect_site_base_url();
+<div class="card">
+  <h3 style="margin-top:0">Recommandations (lecture seule)</h3>
+  <?php if (empty($advice)): ?>
+    <div class="note">Aucune recommandation particulière aux seuils courants.</div>
+  <?php else: ?>
+    <?php foreach ($advice as $a):
+      $lvl = $a['severity'];
+      $cls = $lvl==='CRITIQUE'?'badge-bad':($lvl==='ALERTE'?'badge-warn':'badge-info');
+    ?>
+      <div style="border:1px solid var(--b);border-radius:10px;padding:12px;margin:10px 0;background:#0b1220">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <span class="badge <?=$cls?>"><?=esc($lvl)?></span>
+          <strong><?=esc($a['title'])?></strong>
+        </div>
+        <div class="note" style="margin-bottom:8px"><?=esc($a['why'])?></div>
+        <?php if (!empty($a['suggestions'])): ?>
+          <ul style="margin:0 0 6px 18px;padding:0">
+          <?php foreach ($a['suggestions'] as $s): ?>
+            <li><code><?=esc($s)?></code></li>
+          <?php endforeach; ?>
+          </ul>
+        <?php endif; ?>
+      </div>
+    <?php endforeach; ?>
+  <?php endif; ?>
+  <div class="note">Seuils : grosses tables &ge; <?=esc((string)$tableWarnMB)?> MB — autoload total &ge; <?=esc((string)$autoloadWarnTotalMB)?> MB — option autoload &ge; <?=esc((string)$autoloadWarnOneKB)?> KB — cron &ge; <?=esc((string)$cronWarnMB)?> MB.</div>
+</div>
+<?php endif; ?>
 
-// 4) Collecte des URLs
-$urls = [];
-if ($useSitemap) {
-    $urls = fetch_urls_from_sitemaps($base);
-}
-if (!$urls) {
-    $urls = fetch_urls_from_wpdb($max);
-}
-if (!$urls) { $urls = [$base]; }
-array_unshift($urls, $base);
-$urls = array_values(array_unique($urls));
-$urls = array_slice($urls, 0, $max);
+  <div class="controls">
+    <input id="q" type="search" placeholder="Filtrer (type/objet/détail)…">
+    <select id="lvl">
+      <option value="">Tous niveaux</option>
+      <option value="CRITIQUE">CRITIQUE</option>
+      <option value="ALERTE">ALERTE</option>
+      <option value="INFO">INFO</option>
+    </select>
+    <select id="typ">
+      <option value="">Tous types</option>
+      <?php foreach(array_keys($types) as $t): ?>
+        <option value="<?=esc($t)?>"><?=esc($t)?></option>
+      <?php endforeach; ?>
+    </select>
+    <span class="note">
+      DB: <?=esc($db_name)?> — Prefix: <?=esc($prefix)?> — <?=esc($now)?> — <span class="nowrap">max=<?=esc((string)$max)?></span>
+    </span>
+    <div class="prefixes">
+      <?php foreach ($prefixCounts as $p=>$c): ?>
+        <span class="chip"><b><?=esc($p ?: '(sans prefix)')?></b> : <?=esc((string)$c)?></span>
+      <?php endforeach; ?>
+    </div>
+    <div class="small">Changer de préfixe : ajoute <code>&prefix=xxx_</code> à l’URL. Profondeur : <code>&deep=1</code>. TOP N : <code>&top=100</code>.</div>
+  </div>
+</div>
 
-// 5) Scan
-$results = [];
-$stats = [ 'pages'=>0, 'items'=>0, 'ok'=>0, 'info'=>0, 'warn'=>0, 'crit'=>0 ];
+<div class="card">
+  <table id="tbl">
+    <thead>
+      <tr>
+        <th>Niveau</th>
+        <th>Type</th>
+        <th>Objet</th>
+        <th>Taille</th>
+        <th>Détail</th>
+      </tr>
+    </thead>
+    <tbody>
+    <?php foreach ($rows as $r):
+      $lvl = $r['severity'];
+      $cls = $lvl==='CRITIQUE'?'badge-bad':($lvl==='ALERTE'?'badge-warn':'badge-info');
+      $sz  = isset($r['size']) ? bytesHumanDB((int)$r['size']) : '—';
+      $obj = $r['object'] ?? '—';
+      $det = $r['detail'] ?? '';
+    ?>
+      <tr>
+        <td><span class="badge <?=$cls?>"><?=esc($lvl)?></span></td>
+        <td><?=esc($r['type'])?></td>
+        <td><?=esc($obj)?></td>
+        <td class="size"><?=esc($sz)?></td>
+        <td><?=esc($det)?></td>
+      </tr>
+    <?php endforeach; ?>
+    </tbody>
+  </table>
+</div>
 
-print_header('WP Audit Suite — Données structurées (mod_data.php)');
-
-echo '<div class="card kpi">';
-    echo '<div><div class="muted small">Base URL</div><div>'.h($base).'</div></div>';
-    echo '<div><div class="muted small">Pages ciblées (max)</div><div>'.h((string)$max).'</div></div>';
-    echo '<div><div class="muted small">Source</div><div>'.($useSitemap?'Sitemap &amp; DB':'DB uniquement').'</div></div>';
-    echo '<div><div class="muted small">Test taille logo</div><div>'.($testLogoSize?'Activé':'Non').'</div></div>';
-echo '</div>';
-
-foreach ($urls as $u){
-    $stats['pages']++;
-    $html = http_get_local($u);
-    if (!$html){
-        $results[] = [ 'url'=>$u, 'type'=>'-', 'status'=>'CRITIQUE', 'issues'=>['Page inaccessible'], 'sample'=>'' ];
-        $stats['crit']++; continue;
-    }
-    [$itemsJsonLd, $itemsMicro, $itemsRdfa] = extract_structured_data($html);
-    $items = normalize_structured_data(array_merge($itemsJsonLd, $itemsMicro, $itemsRdfa), $u);
-    if (!$items) {
-        $results[] = [ 'url'=>$u, 'type'=>'-', 'status'=>'INFO', 'issues'=>['Aucun bloc de données structurées détecté'], 'sample'=>'' ];
-        $stats['info']++; continue;
-    }
-    foreach ($items as $it){
-        $stats['items']++;
-        $check = validate_schema_item($it, $base, $testLogoSize);
-        $st = $check['status'];
-        if ($st==='OK') $stats['ok']++; elseif ($st==='INFO') $stats['info']++; elseif ($st==='ALERTE') $stats['warn']++; else $stats['crit']++;
-        $results[] = [
-            'url'=>$u,
-            'type'=> is_array($it['@type'] ?? null) ? implode(',', $it['@type']) : ($it['@type'] ?? 'Unknown'),
-            'status'=>$st,
-            'issues'=>$check['issues'],
-            'sample'=> truncate(json_encode($it, JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE), 900),
-        ];
-    }
-}
-
-// 6) Corrélations globales minimales (doublons Organization)
-$global = correlate_global_inconsistencies($results);
-
-// 7) Rendu
-render_results_table($results, $global, $stats);
-print_footer();
-
-// ==============================
-// Extracteurs & Normalisation
-// ==============================
-function extract_structured_data($html){
-    $jsonld = [];
-    if (preg_match_all('#<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>#is', $html, $m)){
-        foreach ($m[1] as $raw){
-            $raw = trim($raw);
-            $raw = preg_replace("#,\\s*([}\\]])#m", '$1', $raw);
-            $data = json_decode($raw, true);
-            if (json_last_error() !== JSON_ERROR_NONE) continue;
-            if (!$data) continue;
-            if (isset($data['@graph']) && is_array($data['@graph'])){
-                foreach ($data['@graph'] as $g){ $jsonld[] = $g; }
-            } else {
-                $jsonld[] = $data;
-            }
-        }
-    }
-    $micro = [];$rdfa = [];
-    libxml_use_internal_errors(true);
-    $dom = new DOMDocument();
-    if ($dom->loadHTML($html)){
-        $xp = new DOMXPath($dom);
-        foreach ($xp->query('//*[@itemscope and @itemtype]') as $node){
-            $type = $node->getAttribute('itemtype');
-            // itemtype peut être une URL schema.org -> garder le dernier segment
-            $slash = strrpos($type, '/');
-            if ($slash !== false) $type = substr($type, $slash+1);
-            $micro[] = ['@type'=>$type, '@context'=>'https://schema.org'];
-        }
-        foreach ($xp->query('//*[@typeof]') as $node){
-            $type = $node->getAttribute('typeof');
-            if (strpos($type, ':') !== false) $type = substr($type, strrpos($type, ':')+1);
-            $rdfa[] = ['@type'=>$type, '@context'=>'https://schema.org'];
-        }
-    }
-    libxml_clear_errors();
-    return [$jsonld, $micro, $rdfa];
-}
-
-function normalize_structured_data(array $items, $pageUrl){
-    $out = [];
-    foreach ($items as $it){
-        if (!is_array($it)) continue;
-        if (!isset($it['@type']) && isset($it['type'])) $it['@type'] = $it['type'];
-        if (!isset($it['@context'])) $it['@context'] = 'https://schema.org';
-        $fields = ['url','logo','image','@id'];
-        foreach ($fields as $f){
-            if (!empty($it[$f]) && is_string($it[$f]) && strpos($it[$f],'http')!==0){
-                $it[$f] = resolve_url($pageUrl, $it[$f]);
-            }
-        }
-        $out[] = $it;
-    }
-    return $out;
-}
-
-function resolve_url($base, $rel){
-    if (!$rel) return $rel;
-    if (preg_match('#^https?://#i', $rel)) return $rel;
-    $base = rtrim($base,'/');
-    if ($rel[0] === '/') {
-        if (preg_match('#^(https?://[^/]+)#',$base,$m)) return $m[1].$rel;
-        return $base.$rel;
-    }
-    return $base.'/'.ltrim($rel,'/');
-}
-
-// ==============================
-// Validation par type (profil minimal viable)
-// ==============================
-function validate_schema_item(array $it, $siteBase, $testLogoSize=false){
-    $type = $it['@type'] ?? 'Unknown';
-    if (is_array($type)) $type = $type[0];
-    $issues = [];
-    $status = 'OK';
-
-    $req = function($cond, $msg) use (&$issues, &$status){ if (!$cond){ $issues[]=$msg; if ($status!=='CRITIQUE') $status='ALERTE'; } };
-    $rec = function($cond, $msg) use (&$issues){ if (!$cond){ $issues[]=$msg; } };
-
-    switch ($type){
-        case 'Organization':
-        case 'LocalBusiness':
-            $req(!empty($it['name']), 'name requis');
-            $req(!empty($it['url']), 'url requise');
-            if (!empty($it['url'])) $rec(stripos($it['url'], $siteBase)===0, 'url différente du domaine');
-            if (!empty($it['logo'])){
-                $req(is_string($it['logo']) && preg_match('#^https?://#',$it['logo']), 'logo doit être une URL absolue');
-                if ($testLogoSize && is_string($it['logo']) && preg_match('#^https?://#',$it['logo'])){
-                    $sz = fetch_image_size($it['logo']);
-                    if ($sz && ($sz[0] < 112 || $sz[1] < 112)) $issues[] = 'logo < 112×112 recommandé par Google';
-                }
-            } else {
-                $issues[] = 'logo recommandé';
-            }
-            if ($type==='LocalBusiness'){
-                $addr = $it['address'] ?? [];
-                $req(!empty($addr['streetAddress']) && !empty($addr['postalCode']) && !empty($addr['addressLocality']), 'address incomplet (street/postal/locality)');
-                $rec(!empty($it['telephone']), 'telephone recommandé');
-            }
-            break;
-        case 'WebSite':
-            $rec(!empty($it['potentialAction']), 'SearchAction recommandé si recherche interne');
-            break;
-        case 'BreadcrumbList':
-            $itemList = $it['itemListElement'] ?? [];
-            $req(is_array($itemList) && count($itemList)>=2, 'Au moins 2 éléments breadcrumb requis');
-            break;
-        case 'Article':
-        case 'NewsArticle':
-        case 'BlogPosting':
-            $req(!empty($it['headline']), 'headline requis');
-            $req(!empty($it['datePublished']), 'datePublished requise');
-            $req(!empty($it['author']), 'author requis');
-            $rec(!empty($it['image']), 'image recommandée');
-            break;
-        case 'Product':
-            $req(!empty($it['name']), 'name requis');
-            $offers = $it['offers'] ?? [];
-            if (isset($offers['@type']) || isset($offers['price'])){ $offers = [$offers]; }
-            $hasPrice=false; $hasCurr=false;
-            foreach ((array)$offers as $of){ if (!empty($of['price'])) $hasPrice=true; if (!empty($of['priceCurrency'])) $hasCurr=true; }
-            $req($hasPrice, 'offers.price requis');
-            $req($hasCurr, 'offers.priceCurrency requis');
-            $rec(!empty($it['sku']), 'sku recommandé');
-            $rec(!empty($it['brand']), 'brand recommandé');
-            break;
-        case 'FAQPage':
-            $main = $it['mainEntity'] ?? [];
-            $req(is_array($main) && count($main)>=1, 'mainEntity (questions) requis');
-            break;
-        default:
-            $status = 'INFO';
-            $issues[] = 'Type non profilé (contrôles légers)';
-            break;
-    }
-    if ($status==='ALERTE' && empty($issues)) $status='OK';
-    return ['status'=>$status,'issues'=>$issues];
-}
-
-function fetch_image_size($url){
-    $ch = curl_init($url);
-    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER=>true, CURLOPT_FOLLOWLOCATION=>true, CURLOPT_TIMEOUT=>6]);
-    $bin = curl_exec($ch); curl_close($ch);
-    if (!$bin) return null;
-    if (function_exists('getimagesizefromstring')) return @getimagesizefromstring($bin);
-    return null;
-}
-
-// ==============================
-// Corrélations globales (minimum viable)
-// ==============================
-function correlate_global_inconsistencies(array $rows){
-    $orgs = [];
-    foreach ($rows as $r){ if ($r['type']==='Organization' || $r['type']==='LocalBusiness'){ $orgs[]=$r; } }
-    $warn = [];
-    if (count($orgs) >= 2){
-        $warn[] = 'Plusieurs Organization/LocalBusiness détectés sur différentes pages — vérifier les doublons ou conflits de plugins SEO.';
-    }
-    return $warn;
-}
-
-// ==============================
-// Rendu HTML
-// ==============================
-
-function render_results_table($rows, $global, $stats){
-    echo '<div class="card"><h2 style="margin:0 0 8px 0">Synthèse</h2>';
-    echo '<div class="kpi">';
-    echo '<div><div class="muted">Pages scannées</div><div>'.h((string)$stats['pages']).'</div></div>';
-    echo '<div><div class="muted">Blocs détectés</div><div>'.h((string)$stats['items']).'</div></div>';
-    echo '<div><div class="muted">OK</div><div>'.badge((string)$stats['ok'],'OK').'</div></div>';
-    echo '<div><div class="muted">Infos</div><div>'.badge((string)$stats['info'],'INFO').'</div></div>';
-    echo '<div><div class="muted">Alertes</div><div>'.badge((string)$stats['warn'],'ALERTE').'</div></div>';
-    echo '<div><div class="muted">Critiques</div><div>'.badge((string)$stats['crit'],'CRITIQUE').'</div></div>';
-    echo '</div>'; // <-- ferme .kpi
-
-    if ($global){
-        echo '<div class="card" style="margin-top:12px">';
-        echo '<h3 style="margin:0 0 8px 0">Incohérences globales possibles</h3><ul>';
-        foreach ($global as $g){ echo '<li>'.h($g).'</li>'; }
-        echo '</ul></div>';
-    }
-    echo '</div>'; // ferme la card "Synthèse"
-
-    echo '<div class="card">';
-    echo '<h2 style="margin:0 0 8px 0">Détails par page &amp; type</h2>';
-    echo '<div class="small muted" style="margin-bottom:8px">Chaque ligne = un bloc de données structurées détecté.</div>';
-
-    // --- Filtres rapides
-    echo '<div class="small muted" style="margin:8px 0 6px">Filtres rapides :</div>';
-    echo '<div id="status-filters" style="margin-bottom:10px;display:flex;gap:6px;flex-wrap:wrap">';
-    $btnStyle = 'style="background:#0b1220;border:1px solid #1f2937;border-radius:10px;padding:6px 10px;color:#e2e8f0;cursor:pointer"';
-    echo '<button '.$btnStyle.' data-filter="ALL" class="is-active">Tout</button>';
-    echo '<button '.$btnStyle.' data-filter="OK">OK</button>';
-    echo '<button '.$btnStyle.' data-filter="INFO">Infos</button>';
-    echo '<button '.$btnStyle.' data-filter="ALERTE">Alertes</button>';
-    echo '<button '.$btnStyle.' data-filter="CRITIQUE">Critiques</button>';
-    echo '</div>';
-
-    echo '<table id="schema-table"><thead><tr><th style="width:28%">URL</th><th style="width:16%">Type</th><th style="width:14%">Statut</th><th>Points relevés</th></tr></thead><tbody>';
-
-    foreach ($rows as $r){
-        $status = $r['status'];
-        echo '<tr data-status="'.h($status).'">';
-        echo '<td><div class="small"><a href="'.h($r['url']).'" target="_blank" rel="noopener">'.h($r['url']).'</a></div><details><summary class="muted small">extrait</summary><div class="mono">'.h($r['sample']).'</div></details></td>';
-        echo '<td>'.h($r['type']).'</td>';
-        echo '<td>'.badge($status, $status).'</td>';
-        echo '<td><ul style="margin:0;padding-left:18px">';
-        foreach ($r['issues'] as $i){ echo '<li>'.h($i).'</li>'; }
-        echo '</ul></td>';
-        echo '</tr>';
-    }
-    echo '</tbody></table></div>';
-
-    // --- JS de filtrage
-    echo <<<JS
+<div class="card">
+  <a href="?<?=htmlspecialchars(http_build_query(array_merge($_GET, ['format'=>'json'])), ENT_QUOTES)?>">Exporter JSON</a>
+  &nbsp;|&nbsp;
+  <a href="?<?=htmlspecialchars(http_build_query(array_merge($_GET, ['format'=>'txt'])), ENT_QUOTES)?>">Exporter texte</a>
+  <span class="note"> — Paramètres: <code>&prefix=xxx_</code> <code>&deep=1</code> <code>&top=100</code>.</span>
+</div>
+<div class="card">
+  <div class="note">
+    🔔 Rappel : WP Audit Suite est un outil d’audit <b>lecture seule</b>. Ne le laissez pas en production :
+    <b>supprimez</b> les fichiers une fois l’audit terminé.
+  </div>
+</div>
 <script>
-(function(){
-  var btns = document.querySelectorAll('#status-filters button');
-  var rows = document.querySelectorAll('#schema-table tbody tr');
-  function setActive(btn){
-    btns.forEach(function(b){ b.classList.remove('is-active'); b.style.outline='none'; });
-    btn.classList.add('is-active');
-    btn.style.outline='2px solid #1f2937';
-  }
-  function applyFilter(f){
-    rows.forEach(function(tr){
-      if(f === 'ALL'){ tr.style.display=''; return; }
-      var st = (tr.getAttribute('data-status')||'').trim();
-      tr.style.display = (st === f) ? '' : 'none';
-    });
-  }
-  btns.forEach(function(btn){
-    btn.addEventListener('click', function(){
-      setActive(btn);
-      applyFilter(btn.getAttribute('data-filter'));
-    });
+// Filtres client
+const q   = document.getElementById('q');
+const lvl = document.getElementById('lvl');
+const typ = document.getElementById('typ');
+const rows = Array.from(document.querySelectorAll('#tbl tbody tr'));
+function applyFilter(){
+  const needle = q.value.toLowerCase();
+  const level  = lvl.value;
+  const type   = typ.value;
+  rows.forEach(tr => {
+    const lvlCell = tr.querySelector('.badge')?.textContent.trim() || '';
+    const typeCell= tr.children[1]?.textContent.trim() || '';
+    const txt     = tr.innerText.toLowerCase();
+    const okTxt = !needle || txt.includes(needle);
+    const okLvl = !level  || lvlCell === level;
+    const okTyp = !type   || typeCell === type;
+    tr.style.display = (okTxt && okLvl && okTyp) ? '' : 'none';
   });
-})();
-</script>
-JS;
 }
-?>
+[q,lvl,typ].forEach(el => el.addEventListener('input', applyFilter));
+lvl.addEventListener('change', applyFilter);
+typ.addEventListener('change', applyFilter);
+</script>
+
+</body></html>
